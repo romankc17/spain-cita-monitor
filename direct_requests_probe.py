@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
-"""Run one ICP+ check with requests, reusing a verified Chrome session."""
+"""Run ICP+ checks with requests using cookies captured once from Chrome."""
 
 import argparse
+import json
 import ssl
 import tempfile
 from pathlib import Path
@@ -14,6 +15,7 @@ import cita_monitor as cm
 
 
 INTERMEDIATE_CA = "http://cacerts.rapidssl.com/RapidSSLTLSRSACAG1.crt"
+DEFAULT_SESSION = ".icp-session.json"
 
 
 def ca_bundle():
@@ -25,6 +27,47 @@ def ca_bundle():
         bundle.write(Path(certifi.where()).read_text())
         bundle.write(intermediate)
     return bundle.name
+
+
+def save_snapshot(path, user_agent, cookies):
+    data = {
+        "user_agent": user_agent,
+        "cookies": [
+            {
+                "name": cookie["name"],
+                "value": cookie["value"],
+                "domain": cookie.get("domain"),
+                "path": cookie.get("path", "/"),
+            }
+            for cookie in cookies
+            if cookie["name"] != "JSESSIONID"
+        ],
+    }
+    path.write_text(json.dumps(data), encoding="utf-8")
+    path.chmod(0o600)
+    return data
+
+
+def capture_snapshot(path, port, entry_url):
+    options = webdriver.ChromeOptions()
+    options.debugger_address = f"127.0.0.1:{port}"
+    browser = webdriver.Chrome(options=options)
+    cm.select_icp_tab(browser, entry_url)
+    return save_snapshot(
+        path,
+        browser.execute_script("return navigator.userAgent"),
+        browser.get_cookies(),
+    )
+
+
+def load_snapshot(path):
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        if not data["user_agent"] or not isinstance(data["cookies"], list):
+            raise ValueError
+        return data
+    except (FileNotFoundError, KeyError, ValueError, json.JSONDecodeError) as error:
+        raise SystemExit(f"No valid saved session at {path}; run once with --capture") from error
 
 
 class RequestsDriver:
@@ -59,7 +102,10 @@ class RequestsDriver:
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--applicants", default="applicants.json")
+    parser.add_argument("--capture", action="store_true",
+                        help="capture fresh cookies from Chrome before checking")
     parser.add_argument("--attach", type=int, default=9222)
+    parser.add_argument("--session-file", default=DEFAULT_SESSION)
     args = parser.parse_args()
 
     applicant = cm.load_roster(args.applicants)[0]
@@ -70,25 +116,38 @@ def main():
         procedure="TOMA DE HUELLAS",
     )
 
-    options = webdriver.ChromeOptions()
-    options.debugger_address = f"127.0.0.1:{args.attach}"
-    browser = webdriver.Chrome(options=options)
-    cm.select_icp_tab(browser, cm.entry_url(applicant, runtime))
+    snapshot_path = Path(args.session_file)
+    snapshot = (
+        capture_snapshot(snapshot_path, args.attach, cm.entry_url(applicant, runtime))
+        if args.capture else load_snapshot(snapshot_path)
+    )
 
     session = requests.Session()
     session.headers.update({
-        "User-Agent": browser.execute_script("return navigator.userAgent"),
+        "User-Agent": snapshot["user_agent"],
         "Referer": "https://icp.administracionelectronica.gob.es/",
     })
-    for cookie in browser.get_cookies():
-        if cookie["name"] != "JSESSIONID":
-            session.cookies.set(cookie["name"], cookie["value"],
-                                domain=cookie.get("domain"), path=cookie.get("path", "/"))
+    for cookie in snapshot["cookies"]:
+        session.cookies.set(cookie["name"], cookie["value"],
+                            domain=cookie.get("domain"), path=cookie.get("path", "/"))
 
     bundle = ca_bundle()
     try:
         office = cm.offices_for(applicant, runtime)[0]
-        state, procedure = cm.check(RequestsDriver(session, bundle), runtime, applicant, office)
+        try:
+            state, procedure = cm.check(
+                RequestsDriver(session, bundle), runtime, applicant, office
+            )
+        except (requests.RequestException, cm.AccessBlocked) as error:
+            raise SystemExit(
+                f"Direct check failed: {error}. Wait before retrying; use --capture "
+                "when the saved cookies have expired."
+            ) from error
+        save_snapshot(snapshot_path, snapshot["user_agent"], [
+            {"name": cookie.name, "value": cookie.value,
+             "domain": cookie.domain, "path": cookie.path}
+            for cookie in session.cookies
+        ])
         print(f"DIRECT REQUESTS RESULT: {state.upper()} — {procedure}")
     finally:
         session.close()

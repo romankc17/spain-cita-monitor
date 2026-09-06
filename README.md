@@ -35,11 +35,19 @@ Use `Ctrl-C` to stop it. Run the built-in check after changing the code:
 python3 cita_monitor.py --self-test
 ```
 
-For a single experimental check using direct HTTP requests with Chrome's verified cookies:
+To capture verified cookies from Chrome and save them locally:
+
+```bash
+python3 direct_requests_probe.py --capture
+```
+
+Chrome can then be closed. Later checks use only Python requests:
 
 ```bash
 python3 direct_requests_probe.py
 ```
+
+When the saved anti-bot cookies expire, open Chrome and run `--capture` again.
 
 The government site may temporarily block frequent requests. The monitor backs off after a block; intervals under five minutes are intentionally discouraged.
 
