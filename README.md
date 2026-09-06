@@ -35,6 +35,12 @@ Use `Ctrl-C` to stop it. Run the built-in check after changing the code:
 python3 cita_monitor.py --self-test
 ```
 
+For a single experimental check using direct HTTP requests with Chrome's verified cookies:
+
+```bash
+python3 direct_requests_probe.py
+```
+
 The government site may temporarily block frequent requests. The monitor backs off after a block; intervals under five minutes are intentionally discouraged.
 
 The manual Barcelona booking guide is in [`docs/barcelona-tie-appointment.md`](docs/barcelona-tie-appointment.md).
