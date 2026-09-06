@@ -1,0 +1,2 @@
+beautifulsoup4>=4.13,<5
+selenium>=4.35,<5

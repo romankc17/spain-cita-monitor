@@ -1,0 +1,17 @@
+# Real applicant data: NIEs and legal names of living people. Never commit.
+applicants.json
+applicants.*.json
+!applicants.example.json
+
+__pycache__/
+*.pyc
+.venv/
+venv/
+.DS_Store
+.chrome-profile/
+.playwright-cli/
+.playwright-mcp/
+output/
+tmp/
+*.har
+*.log
