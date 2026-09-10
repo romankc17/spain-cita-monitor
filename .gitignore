@@ -3,13 +3,20 @@ applicants.json
 applicants.*.json
 !applicants.example.json
 
+# Proxy lists may embed credentials. Never commit.
+proxies.txt
+proxies.*.txt
+!proxies.example.txt
+
 __pycache__/
 *.pyc
 .venv/
 venv/
 .DS_Store
 .chrome-profile/
+.chrome-profile-*/
 .icp-session.json
+.icp-session-*.json
 .playwright-cli/
 .playwright-mcp/
 output/

@@ -1,0 +1,8 @@
+# One proxy per line. Blank lines and comments are ignored.
+# Accepted forms:
+#   host:port
+#   scheme://user:pass@host:port   (scheme defaults to http)
+#   host:port:user:pass            (provider style, normalized automatically)
+198.51.100.10:8080
+http://user:password@198.51.100.11:3128
+socks5://198.51.100.12:1080
