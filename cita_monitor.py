@@ -20,6 +20,7 @@ import random
 import re
 import ssl
 import subprocess
+import sys
 import tempfile
 import threading
 import time
@@ -39,10 +40,6 @@ from selenium.webdriver.support.ui import WebDriverWait
 DEFAULT_URL = "https://icp.administracionelectronica.gob.es/icpplustieb/citar?p={code}&locale=es"
 MADRID_URL = "https://icp.administracionelectronica.gob.es/icpplustiem/citar?p={code}&locale=es"
 PROVINCES = {8: "Barcelona", 28: "Madrid"}
-# Backend nodes that rejected a mid-flow POST. ICP+ load-balances across nodes
-# whose F5/app configs drift; a session pinned to a bad node can never finish
-# a flow, so its cookies get a full reset until the entry lands elsewhere.
-BAD_NODES = set()
 NO_SLOTS = ("EN ESTE MOMENTO NO HAY CITAS DISPONIBLES", "NO HAY CITAS DISPONIBLES")
 CLAVE_ONLY = "DISPONIBLES PARA LA RESERVA SIN CL@VE"
 BLOCKED = ("INTRUSION PREVENTION VIOLATION", "INTRUSION PREVENTION TRIGGERED")
@@ -79,12 +76,31 @@ class AccessBlocked(RuntimeError):
     pass
 
 
+class C:
+    RESET = "\033[0m"
+    BOLD = "\033[1m"
+    DIM = "\033[2m"
+    RED = "\033[31m"
+    GREEN = "\033[32m"
+    YELLOW = "\033[33m"
+    CYAN = "\033[36m"
+
+
+USE_COLOR = sys.stdout.isatty()
+
+
+def log(tag, message, color=""):
+    """One clean status line: dim timestamp, cyan tag, colored message."""
+    stamp = datetime.now().strftime("%H:%M:%S")
+    if USE_COLOR:
+        print(f"{C.DIM}{stamp}{C.RESET} {C.CYAN}[{tag}]{C.RESET} "
+              f"{color}{message}{C.RESET if color else ''}", flush=True)
+    else:
+        print(f"{stamp} [{tag}] {message}", flush=True)
+
+
 class IndexRedirect(RuntimeError):
     """ICP+ bounced the flow to its index page; restart from the entry URL."""
-
-
-class NodePinned(IndexRedirect):
-    """The entry landed on a backend node already known to reject flows."""
 
 
 def flow_error(url, message):
@@ -221,10 +237,8 @@ def navigate_page(driver, url, method="GET", data=None, expected=None, timeout=4
         try:
             driver.get(url)
         except TimeoutException:
-            try:
-                driver.execute_script("window.stop()")
-            except WebDriverException:
-                pass  # renderer stalled; current_page keeps polling
+            # Let a slow navigation finish while current_page polls its deadline.
+            pass
     else:
         previous = (driver.current_url, driver.page_source)
         driver.execute_script(POST_SCRIPT, url, data or {})
@@ -317,10 +331,8 @@ def entry_url(applicant, args):
 
 
 def reset_app_session(driver, full=False):
-    # full=True drops every cookie including F5's TS* cookies, re-rolling the
-    # backend-node assignment — use after failures, because some nodes bounce
-    # every flow. full=False drops only the finished JSESSIONID so the next
-    # check gets a fresh app session on the same (proven healthy) node.
+    # Reset only this session after a failure. Otherwise preserve its F5
+    # cookies while starting a new app session.
     if full:
         try:
             driver.delete_all_cookies()
@@ -328,18 +340,6 @@ def reset_app_session(driver, full=False):
         except AttributeError:  # lightweight drivers expose only delete_cookie
             pass
     driver.delete_cookie("JSESSIONID")
-
-
-def node_of(driver):
-    """Backend node id from the JSESSIONID suffix (e.g. appdmzmol3_19063)."""
-    try:
-        for cookie in driver.get_cookies():
-            if cookie["name"] == "JSESSIONID":
-                match = re.search(r"\.([A-Za-z0-9_]+)$", cookie["value"])
-                return match.group(1) if match else None
-    except (AttributeError, WebDriverException):
-        pass
-    return None
 
 
 def check(driver, args, applicant, office_name):
@@ -358,20 +358,10 @@ def check(driver, args, applicant, office_name):
             return _check_flow(driver, args, applicant, office_name,
                                reuse_entry and attempt == 0,
                                force_reset=attempt > 0)
-        except NodePinned as bounce:
-            last_bounce = bounce
-            if attempt >= 1:
-                break
-            human_pause(driver)
         except IndexRedirect as bounce:
             last_bounce = bounce
-            node = node_of(driver)
-            if node:
-                if len(BAD_NODES) > 10:
-                    BAD_NODES.clear()
-                BAD_NODES.add(node)
             human_pause(driver)  # space out the retry
-    raise RuntimeError(f"ICP+ kept bouncing to {last_bounce}; its flow may have changed")
+    raise RuntimeError(f"ICP+ redirected this session to {last_bounce} after 3 attempts")
 
 
 def _check_flow(driver, args, applicant, office_name, reuse_entry=False, force_reset=False):
@@ -390,12 +380,6 @@ def _check_flow(driver, args, applicant, office_name, reuse_entry=False, force_r
         # that just proved healthy.
         reset_app_session(driver, full=force_reset or getattr(driver, "needs_reset", False))
         page = navigate_page(driver, entry, expected="#sede", timeout=90)
-    node = node_of(driver)
-    if node and node in BAD_NODES:
-        # This backend node has rejected mid-flow POSTs before. F5 keeps the
-        # same client pinned for minutes, so one re-roll is enough; the loop's
-        # backoff provides the time-based recovery.
-        raise NodePinned(page["url"])
     soup = page["soup"]
     office = soup.select_one("#sede")
     if not office:
@@ -467,7 +451,8 @@ def _check_flow(driver, args, applicant, office_name, reuse_entry=False, force_r
             flow_error(page["url"], f"Unrecognized ICP+ response at {page['url']}")
         form = parent_form(page["soup"], "#btnEnviar", "Confirmation page")
         human_pause(driver)
-        page = submit_form(driver, page, form)
+        # Solicitar Cita's onclick changes the action; the form defaults to salirInicio.
+        page = submit_form(driver, page, form, action="acCitar")
     raise RuntimeError("ICP+ kept asking for confirmation; its flow may have changed")
 
 
@@ -483,7 +468,6 @@ def load_roster(path):
 
 
 def notify(message):
-    print("\a" + message)
     script = 'on run argv\ndisplay notification (item 1 of argv) with title "Cita monitor"\nend run'
     subprocess.run(["osascript", "-e", script, message], check=False)
 
@@ -637,8 +621,6 @@ def save_snapshot(path, user_agent, cookies):
 
 def capture_snapshot(path, browser, entry, stop=None):
     select_icp_tab(browser)
-    print(f"[{path.name}] Complete proxy authentication or any challenge in Chrome. "
-          "Waiting up to 5 minutes for the office list; no Enter key is needed.")
     if browser.current_url != entry:
         navigate_page(browser, entry, expected="#sede", timeout=300, stop=stop)
     else:
@@ -728,7 +710,11 @@ class ProxySession:
         self.profile = profile or (
             session_path(Path(".chrome-profile"), proxy) if proxy else Path(".chrome-profile")
         )
-        self.tag = chrome_proxy(proxy) if proxy else "direct"
+        if proxy:
+            parsed = urlparse(proxy)
+            self.tag = f"{parsed.hostname}:{parsed.port}" if parsed.port else parsed.hostname
+        else:
+            self.tag = "direct"
         self.session = None
         self.user_agent = ""
         self.browser = None
@@ -764,34 +750,31 @@ class ProxySession:
             for office_name in offices_for(applicant, runtime):
                 province = applicant.get("province_code", runtime.province_code)
                 location = PROVINCES.get(province, f"province {province}")
-                label = (f"{applicant['name']} ({applicant['nie']}) "
-                         f"in {location} at {office_name}")
+                label = f"{applicant['name']} · {location}"
                 try:
                     state, procedure = check(driver, runtime, applicant, office_name)
                     driver.needs_reset = False  # flow completed; session pins a healthy node
                     self.save()
                 except AccessBlocked as error:
                     driver.needs_reset = True
-                    node = node_of(driver)
-                    if node:
-                        if len(BAD_NODES) > 10:
-                            BAD_NODES.clear()
-                        BAD_NODES.add(node)
-                        print(f"[{self.tag}] backend node {node} marked unhealthy; "
-                              "next capture re-rolls it")
-                    print(f"[{self.tag}] BLOCKED: {str(error).splitlines()[0]}")
+                    detail = str(error).splitlines()[0]
+                    if self.proxy:
+                        detail = detail.replace(self.proxy, self.tag)
+                    log(self.tag, detail, C.YELLOW)
                     return "blocked"
                 except (requests.RequestException, RuntimeError, WebDriverException, OSError) as error:
                     driver.needs_reset = True
                     detail = str(error).splitlines()[0]
                     if self.proxy:
                         detail = detail.replace(self.proxy, self.tag)
-                    print(f"[{self.tag}] FAILED: {type(error).__name__}: {detail}. "
-                          "Wait before retrying; use --capture to check in Chrome.")
+                    log(self.tag, f"error: {detail}", C.RED)
                     return None
-                print(f"[{self.tag}] {state.upper()} — {label} — {procedure}")
                 if state == "available":
+                    log(self.tag, f"\aSLOTS AVAILABLE — {label} at {office_name} — {procedure}",
+                        C.BOLD + C.GREEN)
                     return "available"
+                color = C.DIM + C.GREEN if state == "no_slots" else C.YELLOW
+                log(self.tag, f"{state} · {label}", color)
         return "ok"
 
     def recapture(self, entry, stop=None, attach=None):
@@ -805,11 +788,12 @@ class ProxySession:
                 self.process = launch_chrome(self.proxy, self.profile, entry)
                 attach = launched_debug_port(self.profile, process=self.process)
             self.browser = attach_chrome(attach)
+            log(self.tag, "capturing — solve any proxy login or challenge in the window", C.CYAN)
             notify(f"Session {self.tag}: complete any authentication or challenge in Chrome.")
             snapshot = capture_snapshot(self.path, self.browser, entry, stop=stop)
         except (RuntimeError, WebDriverException, OSError) as error:
             if not (stop and stop.is_set()):
-                print(f"[{self.tag}] Chrome recovery failed: {str(error).splitlines()[0]}")
+                log(self.tag, f"capture failed: {str(error).splitlines()[0]}", C.RED)
             self.close_browser()
             return False
         if self.session:
@@ -817,7 +801,7 @@ class ProxySession:
         self.session = build_session(snapshot, self.proxy)
         self.user_agent = snapshot["user_agent"]
         self.fresh_capture = True
-        print(f"[{self.tag}] Office list verified; continuing checks in this Chrome session.")
+        log(self.tag, "session ready", C.GREEN)
         # Let the page settle: F5's telemetry beacons must fire before the
         # first POST, or the freshly captured session gets rejected mid-flow.
         if stop:
@@ -859,6 +843,8 @@ class Scheduler:
         self.jitter = jitter
         self.started_at = None
         self.stop = threading.Event()
+        # ponytail: one capture at a time limits Chrome load; bound parallelism if startup is too slow.
+        self.capture_lock = threading.Lock()
 
     def run_once(self):
         """Check every session in parallel; return one result per session."""
@@ -886,21 +872,12 @@ class Scheduler:
         interval / N later, so checks spread uniformly across the period and
         every session keeps an exact period no matter how long a check takes."""
         self.started_at = time.monotonic()
-        # Capture the windows one at a time: ten simultaneous F5 challenges
-        # overwhelm the machine and can stall every renderer past the timeout.
-        # Failed captures are retried by each session's own loop.
-        for session in self.sessions:
-            if self.stop.is_set():
-                break
-            if session.browser is None:
-                session.recapture(self.entry, stop=self.stop)
         threads = [threading.Thread(target=self._loop, args=(index, session))
                    for index, session in enumerate(self.sessions)]
         stagger = self.interval / len(self.sessions)
-        jitter = f", jitter up to {self.jitter}s" if self.jitter else ""
-        print(f"Checking {len(self.sessions)} session(s) in Chrome: each every "
-              f"{self.interval} seconds — one request every {stagger:.0f} seconds "
-              f"across all sessions{jitter}. Ctrl-C to stop.")
+        jitter = f" · jitter ≤{self.jitter}s" if self.jitter else ""
+        log("monitor", f"{len(self.sessions)} sessions · one check every {stagger:.0f}s "
+                       f"(every {self.interval}s per session){jitter} · Ctrl-C to stop", C.CYAN)
         try:
             for thread in threads:
                 thread.start()
@@ -908,7 +885,7 @@ class Scheduler:
                 for thread in threads:
                     thread.join(1)
         except KeyboardInterrupt:
-            print("\nStopping...")
+            log("monitor", "stopping…", C.YELLOW)
             self.stop.set()
             for thread in threads:
                 thread.join()
@@ -918,26 +895,23 @@ class Scheduler:
         failures = 0
         cooloffs = 0
         while not self.stop.is_set():
-            if session.browser is None:
-                cooloffs = 0
-                if session.recapture(self.entry, stop=self.stop):
-                    failures = 0
-                else:
-                    failures += 1
-                    delay = min(300 * 2 ** min(failures - 1, 4), 3600)
-                    print(f"[{session.tag}] No usable Chrome session; "
-                          f"retrying in {delay:.0f} seconds.")
-                    next_tick = time.monotonic() + delay
-                    if self.stop.wait(delay):
-                        return
-                    continue
+            # Apply backoff before relaunching Chrome, not just before checking.
             wait = next_tick - time.monotonic()
-            # A freshly captured session must be checked immediately: the app
-            # session goes stale within minutes, and checking while it is warm
-            # continues the flow like a human would.
             if wait > 0 and not session.fresh_capture and \
                     self.stop.wait(wait + random.uniform(0, self.jitter)):
                 return
+            if session.browser is None:
+                cooloffs = 0
+                with self.capture_lock:
+                    captured = session.recapture(self.entry, stop=self.stop)
+                if self.stop.is_set():
+                    return
+                if not captured:
+                    failures += 1
+                    delay = min(300 * 2 ** min(failures - 1, 4), 3600)
+                    log(session.tag, f"no session — retry in {delay:.0f}s", C.DIM)
+                    next_tick = time.monotonic() + delay
+                    continue
             result = session.check_all(self.bundle, self.roster, self.runtime)
             now = time.monotonic()
             if result == "available":
@@ -951,14 +925,14 @@ class Scheduler:
                     # and retry in the same window before relaunching Chrome.
                     cooloffs += 1
                     delay = 90 * cooloffs
-                    print(f"[{session.tag}] Blocked; cooling down {delay:.0f} seconds "
-                          "before retrying in this window.")
+                    log(session.tag, f"cooldown {delay:.0f}s, retry in same window", C.DIM)
                     next_tick = now + delay
                     continue
                 delay = max(self.interval, min(300 * 2 ** min(failures - 1, 4), 3600))
-                print(f"[{session.tag}] {'Blocked' if result == 'blocked' else 'Check failed'}; "
-                      f"retrying in {delay:.0f} seconds.")
-                if session.browser is not None and (result == "blocked" or failures >= 2):
+                recapture = result == "blocked" or failures >= 2
+                recovery = "fresh capture" if recapture else "same window"
+                log(session.tag, f"retry in {delay:.0f}s ({recovery})", C.DIM)
+                if session.browser is not None and recapture:
                     # A sticky proxy may have rotated its exit IP, and the F5
                     # cookies are tied to the old one; repeated flow failures
                     # mean the app session is wedged. Either way, drop Chrome
@@ -1007,12 +981,6 @@ def self_test():
         flow_error("https://x/icpplustieb/acInfo", "msg")
     except RuntimeError as error:
         assert type(error) is RuntimeError and str(error) == "msg"
-
-    class NodeChrome:
-        def get_cookies(self):
-            return [{"name": "JSESSIONID",
-                     "value": "8A4B0127E83F9024E3BDA1FBE7F7F412.appdmzmol3_19063_icpplustieb"},
-                    {"name": "TS01abc", "value": "xyz"}]
 
     soup = BeautifulSoup(
         '<form><input name="token" value="abc"><input type="radio" name="doc" '
@@ -1063,9 +1031,6 @@ def self_test():
 
         def delete_cookie(self, name):
             self.deleted.append(name)
-
-    assert node_of(NodeChrome()) == "appdmzmol3_19063_icpplustieb"
-    assert node_of(FakeChrome()) is None
 
     applicant = {"nie": "X0000000T", "name": "TEST", "nationality": "NEPAL"}
     fake = FakeChrome()
@@ -1167,7 +1132,7 @@ def self_test():
 
     # ProxySession derives redacted tags and never exposes credentials.
     session = ProxySession(proxies[1], paths[1])
-    assert session.tag == "http://198.51.100.11:3128"
+    assert session.tag == "198.51.100.11:3128"
     assert ProxySession(None, base).tag == "direct"
     assert session.profile == session_path(Path(".chrome-profile"), proxies[1])
 
@@ -1222,6 +1187,34 @@ def self_test():
                 raise self.error
             return StubResponse(url, next(self.pages))
 
+    # Real ICP+ menu: its default action exits; Solicitar Cita uses acCitar.
+    # Exercise the same full flow in Chrome and HTTP, including each outcome.
+    for transport in (FakeChrome, lambda: RequestsDriver(StubSession(), True)):
+        for result_html, expected_state in (
+            ("<p>En este momento no hay citas disponibles</p>", "no_slots"),
+            ("<p>En este momento no hay citas disponibles para la reserva sin Cl@ve.</p>",
+             "clave_only"),
+            ('<select id="txtFecha"></select>', "available"),
+        ):
+            driver = transport()
+            responses = (list(driver.session.pages) if isinstance(driver, RequestsDriver)
+                         else list(driver.responses))
+            responses[-1:] = [
+                '<form action="salirInicio"><input name="token" value="keep-me">'
+                '<input id="btnEnviar" type="button" value="Solicitar Cita" '
+                'onclick="enviar(\'solicitud\')"></form>',
+                result_html,
+            ]
+            if isinstance(driver, RequestsDriver):
+                driver.session.pages = iter(responses)
+            else:
+                driver.responses = iter(responses)
+            with patch(f"{__name__}.navigate_page", wraps=navigate_page) as navigation:
+                assert check(driver, args, applicant, "Cualquier oficina")[0] == expected_state
+            final_request = navigation.call_args
+            assert final_request.args[1].endswith("/acCitar"), final_request
+            assert final_request.args[2:] == ("POST", {"token": "keep-me"})
+
     def stubbed(path, error=None):
         session = ProxySession(None, path)
         session.session = StubSession(error)
@@ -1249,6 +1242,18 @@ def self_test():
         browser_session.browser.get_cookies = lambda: []
         browser_session.user_agent = "browser-ua"
         assert browser_session.check_all(None, [applicant], args) == "ok"
+
+        # A rejection on one session must not veto another on the same backend.
+        for index, rejected in enumerate((True, False, False)):
+            independent = ProxySession(None, Path(tmp) / f"independent-{index}.json")
+            independent.browser = FakeChrome()
+            independent.browser.get_cookies = lambda: [
+                {"name": "JSESSIONID", "value": "session.shared_backend"}]
+            if rejected:
+                independent.browser.responses = iter([
+                    "<title>Request Rejected</title><p>Your support ID is: 123</p>"])
+            assert independent.check_all(None, [applicant], args) == (
+                "blocked" if rejected else "ok")
 
         # Failed capture cannot overwrite the last usable snapshot or read stdin.
         original = snapshot.read_text()
@@ -1327,6 +1332,19 @@ def self_test():
     else:
         raise AssertionError("Chrome network error page was accepted")
 
+    class SlowChrome(NetErrorChrome):
+        page_source = '<select id="sede"></select>'
+
+        def get(self, _url):
+            raise TimeoutException("Navigation is still in progress")
+
+        def execute_script(self, script, *args):
+            if script == "window.stop()":
+                self.page_source = ""  # cancelling navigation prevents the office list loading
+            return "complete"
+
+    assert navigate_page(SlowChrome(), url, expected="#sede", timeout=0)["soup"].select_one("#sede")
+
     stop = threading.Event()
     stop.set()
     try:
@@ -1369,6 +1387,7 @@ def self_test():
     assert steady.check_all.call_count == 2
 
     blocked = Mock(tag="blocked", browser=object())
+    blocked.close_browser.side_effect = lambda: setattr(blocked, "browser", None)
     # Two in-window cooldowns (90s, 180s), then close + full backoff (1200s).
     assert run_loop(blocked, ["blocked", "blocked", "blocked"]) == [90, 180, 1200]
     assert blocked.recapture.call_count == 0
@@ -1382,6 +1401,18 @@ def self_test():
     wedged = Mock(tag="wedged", browser=object())
     assert run_loop(wedged, [None, None]) == [300, 600]
     assert wedged.close_browser.call_count == 1
+
+    # Recapturing an office list does not erase repeated availability failures.
+    repeated = Mock(tag="repeated", browser=object())
+    repeated.close_browser.side_effect = lambda: setattr(repeated, "browser", None)
+
+    def recapture_repeated(*_args, **_kwargs):
+        repeated.browser = object()
+        return True
+
+    repeated.recapture.side_effect = recapture_repeated
+    assert run_loop(repeated, [None, None, None], end=2500) == [300, 600, 1200]
+    assert repeated.recapture.call_count == 1
 
     # A check that overruns its slot still lands back on the grid: period 200,
     # first check takes 250, so only 150 remain until the next grid tick.
@@ -1502,18 +1533,16 @@ def main():
             parser.error(f"per-session interval works out to {interval}s; "
                          "increase --every or add more proxies (minimum 60)")
         if interval < 300:
-            print("WARNING: per-session intervals below 5 minutes increase the "
-                  "chance of a bot-protection challenge.")
+            log("monitor", "WARNING: per-session intervals below 5 minutes increase "
+                           "the chance of a bot-protection challenge.", C.YELLOW)
     if args.jitter and interval is None:
         parser.error("--jitter only applies with --interval/--every")
 
     bundle = None if (args.capture or interval) else ca_bundle()
     try:
         if interval:
-            # Interval mode always checks in Chrome: each session opens its own
-            # window inside its loop thread, so all windows come up in parallel.
-            for session in sessions:
-                print(f"[{session.tag}] session file: {session.path}")
+            # Interval mode always checks in Chrome; startup captures open one
+            # window at a time, then every session loops on the uniform grid.
             scheduler = Scheduler(sessions, interval, bundle, roster, args, entry,
                                   jitter=args.jitter)
             scheduler.run()
@@ -1524,14 +1553,14 @@ def main():
                         raise SystemExit(f"[{session.tag}] Could not verify a usable Chrome session")
                 else:
                     session.load()
-                print(f"[{session.tag}] session file: {session.path}")
+                log(session.tag, f"session file: {session.path}", C.DIM)
 
             results = Scheduler(sessions, None, bundle, roster, args, entry).run_once()
             failed = sum(1 for result in results if result in (None, "blocked"))
             if failed:
                 raise SystemExit(f"{failed} of {len(results)} session(s) failed")
     except KeyboardInterrupt:
-        print("\nStopping...")
+        log("monitor", "stopping…", C.YELLOW)
     finally:
         for session in sessions:
             session.close()

@@ -9,10 +9,10 @@ Everything runs through one script, `cita_monitor.py`. In continuous mode it ope
 With `applicants.json` and `proxies.txt` in place (see Setup), one command:
 
 ```bash
-python3 -u cita_monitor.py --proxies proxies.txt --every 30
+python3 -u cita_monitor.py --proxies proxies.txt --interval 300
 ```
 
-That opens 10 Chrome windows (one per proxy), checks one session every 30 seconds, keeps a 5-minute gap per session, and recovers by itself from blocks, app hiccups, and proxy blips. If a Chrome window asks for the proxy username/password, enter it once — the profile remembers it. To stop: Ctrl-C. To stop leftover windows after an unclean exit: `pkill -f "user-data-dir=$PWD/.chrome-profile"`.
+That opens one Chrome window per active proxy and keeps each session on a 5-minute schedule, even if you change the number of proxies. Checks are staggered across that interval. If a Chrome window asks for the proxy username/password, enter it in that window. To stop: Ctrl-C. To stop leftover windows after an unclean exit: `pkill -f "user-data-dir=$PWD/.chrome-profile"`.
 
 ## Setup
 
@@ -67,6 +67,10 @@ python3 -u cita_monitor.py --proxies proxies.txt --every 30
 Interval mode always checks inside Chrome (HTTP replay is not used there): startup captures open one window at a time (ten simultaneous F5 challenges can stall renderers), wait for the office list, and reuse that verified page for the first check. The flow paces itself with human-like delays between form steps to keep the F5 bot score low. A session that completes a check keeps its cookies — they pin it to a healthy backend node; cookies are fully reset only after a failure or a bounce to the app's index/infogenerica interstitials, which the flow retries automatically. If F5 rejects a request, the session cools down 90s and retries in the same window before escalating; a persistent block or repeated failure closes the browser and re-captures a fresh session — that also handles a sticky proxy rotating its exit IP. If the proxies themselves fail (e.g. traffic exhausted), sessions back off and keep retrying, so the monitor resumes by itself once they work again. When a possible slot appears, the script sends a macOS notification and stops. Ctrl-C cancels challenge waiting without needing Enter.
 
 The minimum per-session interval is 60 seconds; under 5 minutes per session is discouraged because frequent checks can trigger protection.
+
+Recovery waits before reopening Chrome and captures one browser at a time. Only a completed availability check resets the failure backoff. A rejected or redirected session does not blacklist a backend for other sessions.
+
+`ERR_TUNNEL_CONNECTION_FAILED` means the proxy tunnel could not be established; it is not an availability result. If a proxy repeatedly fails for ICP+, comment out its line in `proxies.txt` and use `--interval 300` to preserve the cadence for the remaining sessions. Restart after editing the proxy list. Restore the line once its connection works again.
 
 ## Rejected requests
 
