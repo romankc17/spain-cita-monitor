@@ -39,6 +39,10 @@ from selenium.webdriver.support.ui import WebDriverWait
 DEFAULT_URL = "https://icp.administracionelectronica.gob.es/icpplustieb/citar?p={code}&locale=es"
 MADRID_URL = "https://icp.administracionelectronica.gob.es/icpplustiem/citar?p={code}&locale=es"
 PROVINCES = {8: "Barcelona", 28: "Madrid"}
+# Backend nodes that rejected a mid-flow POST. ICP+ load-balances across nodes
+# whose F5/app configs drift; a session pinned to a bad node can never finish
+# a flow, so its cookies get a full reset until the entry lands elsewhere.
+BAD_NODES = set()
 NO_SLOTS = ("EN ESTE MOMENTO NO HAY CITAS DISPONIBLES", "NO HAY CITAS DISPONIBLES")
 CLAVE_ONLY = "DISPONIBLES PARA LA RESERVA SIN CL@VE"
 BLOCKED = ("INTRUSION PREVENTION VIOLATION", "INTRUSION PREVENTION TRIGGERED")
@@ -79,6 +83,10 @@ class IndexRedirect(RuntimeError):
     """ICP+ bounced the flow to its index page; restart from the entry URL."""
 
 
+class NodePinned(IndexRedirect):
+    """The entry landed on a backend node already known to reject flows."""
+
+
 def flow_error(url, message):
     # index.html and infogenerica are transient interstitials: ICP+ bounces the
     # flow there on app hiccups; restart from the entry URL instead of failing.
@@ -89,9 +97,10 @@ def flow_error(url, message):
 
 def human_pause(driver):
     # Chrome mode only: HTTP replay stays fast. Pacing between form steps keeps
-    # the request pattern closer to a human and lowers the F5 bot score.
+    # the request pattern closer to a human and gives F5's telemetry beacons
+    # time to fire — POSTing right after the office list renders gets rejected.
     if not isinstance(driver, RequestsDriver):
-        time.sleep(random.uniform(1.5, 3.5))
+        time.sleep(random.uniform(4, 9))
 
 
 # ---------------------------------------------------------------------------
@@ -307,16 +316,30 @@ def entry_url(applicant, args):
     return applicant.get("url", MADRID_URL if code == 28 else args.url).format(code=code)
 
 
-def reset_app_session(driver):
-    # Drop every cookie, including the F5 TS* bot-protection cookies, so the
-    # entry request re-runs the challenge and gets pinned to a healthy backend
-    # node. Reusing a node whose pinned session has gone stale bounces the
-    # flow to the index interstitial, so a full reset per check is worth the
-    # extra seconds the challenge takes.
+def reset_app_session(driver, full=False):
+    # full=True drops every cookie including F5's TS* cookies, re-rolling the
+    # backend-node assignment — use after failures, because some nodes bounce
+    # every flow. full=False drops only the finished JSESSIONID so the next
+    # check gets a fresh app session on the same (proven healthy) node.
+    if full:
+        try:
+            driver.delete_all_cookies()
+            return
+        except AttributeError:  # lightweight drivers expose only delete_cookie
+            pass
+    driver.delete_cookie("JSESSIONID")
+
+
+def node_of(driver):
+    """Backend node id from the JSESSIONID suffix (e.g. appdmzmol3_19063)."""
     try:
-        driver.delete_all_cookies()
-    except AttributeError:  # lightweight drivers expose only delete_cookie
-        driver.delete_cookie("JSESSIONID")
+        for cookie in driver.get_cookies():
+            if cookie["name"] == "JSESSIONID":
+                match = re.search(r"\.([A-Za-z0-9_]+)$", cookie["value"])
+                return match.group(1) if match else None
+    except (AttributeError, WebDriverException):
+        pass
+    return None
 
 
 def check(driver, args, applicant, office_name):
@@ -335,8 +358,18 @@ def check(driver, args, applicant, office_name):
             return _check_flow(driver, args, applicant, office_name,
                                reuse_entry and attempt == 0,
                                force_reset=attempt > 0)
+        except NodePinned as bounce:
+            last_bounce = bounce
+            if attempt >= 1:
+                break
+            human_pause(driver)
         except IndexRedirect as bounce:
             last_bounce = bounce
+            node = node_of(driver)
+            if node:
+                if len(BAD_NODES) > 10:
+                    BAD_NODES.clear()
+                BAD_NODES.add(node)
             human_pause(driver)  # space out the retry
     raise RuntimeError(f"ICP+ kept bouncing to {last_bounce}; its flow may have changed")
 
@@ -351,12 +384,18 @@ def _check_flow(driver, args, applicant, office_name, reuse_entry=False, force_r
         else:
             reuse_entry = False
     if not reuse_entry:
-        # Reset cookies only when the previous check failed or the flow
-        # bounced: a working session is pinned to a healthy backend node,
-        # and resetting re-rolls the dice on ICP+'s mixed node pool.
-        if force_reset or getattr(driver, "needs_reset", False):
-            reset_app_session(driver)
-        page = navigate_page(driver, entry, expected="#sede")
+        # A completed JSESSIONID cannot be reused, so the flow always starts
+        # with a fresh app session. A full cookie reset (new backend node) only
+        # happens after failures — a working session stays pinned to the node
+        # that just proved healthy.
+        reset_app_session(driver, full=force_reset or getattr(driver, "needs_reset", False))
+        page = navigate_page(driver, entry, expected="#sede", timeout=90)
+    node = node_of(driver)
+    if node and node in BAD_NODES:
+        # This backend node has rejected mid-flow POSTs before. F5 keeps the
+        # same client pinned for minutes, so one re-roll is enough; the loop's
+        # backoff provides the time-based recovery.
+        raise NodePinned(page["url"])
     soup = page["soup"]
     office = soup.select_one("#sede")
     if not office:
@@ -733,6 +772,13 @@ class ProxySession:
                     self.save()
                 except AccessBlocked as error:
                     driver.needs_reset = True
+                    node = node_of(driver)
+                    if node:
+                        if len(BAD_NODES) > 10:
+                            BAD_NODES.clear()
+                        BAD_NODES.add(node)
+                        print(f"[{self.tag}] backend node {node} marked unhealthy; "
+                              "next capture re-rolls it")
                     print(f"[{self.tag}] BLOCKED: {str(error).splitlines()[0]}")
                     return "blocked"
                 except (requests.RequestException, RuntimeError, WebDriverException, OSError) as error:
@@ -772,6 +818,12 @@ class ProxySession:
         self.user_agent = snapshot["user_agent"]
         self.fresh_capture = True
         print(f"[{self.tag}] Office list verified; continuing checks in this Chrome session.")
+        # Let the page settle: F5's telemetry beacons must fire before the
+        # first POST, or the freshly captured session gets rejected mid-flow.
+        if stop:
+            stop.wait(12)
+        else:
+            time.sleep(12)
         return True
 
     def close_browser(self):
@@ -880,7 +932,11 @@ class Scheduler:
                         return
                     continue
             wait = next_tick - time.monotonic()
-            if wait > 0 and self.stop.wait(wait + random.uniform(0, self.jitter)):
+            # A freshly captured session must be checked immediately: the app
+            # session goes stale within minutes, and checking while it is warm
+            # continues the flow like a human would.
+            if wait > 0 and not session.fresh_capture and \
+                    self.stop.wait(wait + random.uniform(0, self.jitter)):
                 return
             result = session.check_all(self.bundle, self.roster, self.runtime)
             now = time.monotonic()
@@ -952,6 +1008,12 @@ def self_test():
     except RuntimeError as error:
         assert type(error) is RuntimeError and str(error) == "msg"
 
+    class NodeChrome:
+        def get_cookies(self):
+            return [{"name": "JSESSIONID",
+                     "value": "8A4B0127E83F9024E3BDA1FBE7F7F412.appdmzmol3_19063_icpplustieb"},
+                    {"name": "TS01abc", "value": "xyz"}]
+
     soup = BeautifulSoup(
         '<form><input name="token" value="abc"><input type="radio" name="doc" '
         'value="NIE" checked><select id="sede" name="sede"><option value="99" '
@@ -1002,11 +1064,14 @@ def self_test():
         def delete_cookie(self, name):
             self.deleted.append(name)
 
+    assert node_of(NodeChrome()) == "appdmzmol3_19063_icpplustieb"
+    assert node_of(FakeChrome()) is None
+
     applicant = {"nie": "X0000000T", "name": "TEST", "nationality": "NEPAL"}
     fake = FakeChrome()
     assert check(fake, args, applicant, "Cualquier oficina")[0] == "no_slots"
-    # Cookies survive a successful check (they pin a healthy backend node).
-    assert fake.deleted == []
+    # A steady check drops only the finished JSESSIONID and keeps F5 cookies.
+    assert fake.deleted == ["JSESSIONID"]
 
     class BounceChrome(FakeChrome):
         def __init__(self):
@@ -1047,7 +1112,7 @@ def self_test():
         bounce = BounceChrome()
         assert check(bounce, args, applicant, "Cualquier oficina")[0] == "no_slots"
         # The bounced attempt restarted the flow with a full cookie reset.
-        assert bounce.deleted == ["JSESSIONID"]
+        assert bounce.deleted == ["JSESSIONID", "JSESSIONID"]
 
     reuse = FakeChrome()
     reuse.reuse_entry = True
@@ -1205,6 +1270,7 @@ def self_test():
                 patch(f"{__name__}.launched_debug_port", return_value=1234), \
                 patch(f"{__name__}.attach_chrome", return_value=browser), \
                 patch(f"{__name__}.notify"), \
+                patch(f"{__name__}.time.sleep"), \
                 patch(f"{__name__}.capture_snapshot", return_value={"user_agent": "ua", "cookies": []}):
             assert recovered_session.recapture(DEFAULT_URL.format(code=8))
         assert recovered_session.browser is browser and not process.terminate.called
@@ -1281,6 +1347,7 @@ def self_test():
     def run_loop(session, results, interval=200, end=None):
         clock = FakeClock()
         session.check_all.side_effect = results
+        session.fresh_capture = False
         scheduler = Scheduler([session], interval, None, [], args, url)
         scheduler.started_at = clock.now
         end = clock.now + interval * len(results) if end is None else end
@@ -1320,6 +1387,7 @@ def self_test():
     # first check takes 250, so only 150 remain until the next grid tick.
     clock = FakeClock()
     stalled = Mock(tag="stalled", browser=object())
+    stalled.fresh_capture = False
     check_count = {"count": 0}
 
     def slow_then_fast(*_args):
