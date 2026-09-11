@@ -18,6 +18,7 @@ import math
 import os
 import random
 import re
+import shutil
 import ssl
 import subprocess
 import sys
@@ -468,15 +469,41 @@ def load_roster(path):
 
 
 def notify(message):
-    script = 'on run argv\ndisplay notification (item 1 of argv) with title "Cita monitor"\nend run'
-    subprocess.run(["osascript", "-e", script, message], check=False)
+    # Keep alerts visible even without a desktop notification service.
+    log("notification", message)
+    if sys.platform == "darwin":
+        script = 'on run argv\ndisplay notification (item 1 of argv) with title "Cita monitor"\nend run'
+        command = ["osascript", "-e", script, message]
+    elif sys.platform.startswith("linux"):
+        command = ["notify-send", "--", "Cita monitor", message]
+    else:
+        return
+    if not shutil.which(command[0]):
+        return
+    try:
+        result = subprocess.run(command, check=False, timeout=10,
+                                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        if result.returncode:
+            log("notification", "Desktop notification unavailable; alert logged above.", C.YELLOW)
+    except (OSError, subprocess.TimeoutExpired):
+        log("notification", "Desktop notification failed; alert logged above.", C.YELLOW)
 
 
 # ---------------------------------------------------------------------------
 # Chrome and proxies
 # ---------------------------------------------------------------------------
 
-CHROME_BINARY = "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
+def chrome_binary():
+    override = os.environ.get("CHROME_BINARY")
+    candidates = [override] if override else (
+        (["/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"] if sys.platform == "darwin" else [])
+        + ["google-chrome", "google-chrome-stable", "chromium", "chromium-browser"]
+    )
+    for candidate in candidates:
+        binary = shutil.which(candidate)
+        if binary:
+            return binary
+    raise RuntimeError("Chrome/Chromium not found. Install it or set CHROME_BINARY to its executable.")
 
 
 def select_icp_tab(driver):
@@ -531,6 +558,10 @@ def lock_owner_alive(lock):
 
 
 def launch_chrome(proxy, profile_dir, url):
+    binary = chrome_binary()
+    if sys.platform.startswith("linux") and not (os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY")):
+        raise RuntimeError("Chrome needs a Linux desktop session (DISPLAY or WAYLAND_DISPLAY); "
+                           "use a desktop or remote desktop to complete site challenges.")
     # Port 0 lets Chrome pick a free debugging port itself; the chosen port is
     # read back from DevToolsActivePort, so there is no bind/close race.
     profile_dir = profile_dir.resolve()
@@ -543,7 +574,7 @@ def launch_chrome(proxy, profile_dir, url):
     lock.unlink(missing_ok=True)
     (profile_dir / "DevToolsActivePort").unlink(missing_ok=True)
     command = [
-        CHROME_BINARY,
+        binary,
         "--remote-debugging-port=0",
         f"--user-data-dir={profile_dir}",
         "--no-first-run",
@@ -569,6 +600,7 @@ def launched_debug_port(profile_dir, attempts=30, process=None):
 
 def attach_chrome(port, attempts=30):
     options = webdriver.ChromeOptions()
+    options.binary_location = chrome_binary()
     options.debugger_address = f"127.0.0.1:{port}"
     for _ in range(attempts):
         try:
@@ -954,6 +986,75 @@ def self_test():
 
     # Pacing between form steps is exercised live; keep the self-test fast.
     globals()["human_pause"] = lambda driver: None
+
+    # Browser discovery, launch and attachment use the same executable on both OSes.
+    for platform, executable in (
+        ("darwin", "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"),
+        ("linux", "google-chrome"), ("linux", "google-chrome-stable"),
+        ("linux", "chromium"), ("linux", "chromium-browser"),
+    ):
+        with patch.object(sys, "platform", platform), \
+                patch.dict(os.environ, {}, clear=True), \
+                patch.object(shutil, "which", side_effect=lambda name: name if name == executable else None):
+            assert chrome_binary() == executable
+            os.environ["CHROME_BINARY"] = "missing-custom-browser"
+            try:
+                chrome_binary()
+            except RuntimeError as error:
+                assert "CHROME_BINARY" in str(error)
+            else:
+                raise AssertionError("Invalid browser override silently fell back")
+
+    with tempfile.TemporaryDirectory() as tmp, \
+            patch.dict(os.environ, {"CHROME_BINARY": "/custom/Chrome Browser", "DISPLAY": ":1"}, clear=True), \
+            patch.object(sys, "platform", "linux"), \
+            patch.object(shutil, "which", return_value="/custom/Chrome Browser"), \
+            patch.object(subprocess, "Popen") as launch, \
+            patch.object(webdriver, "Chrome") as attach:
+        profile = Path(tmp) / "profile with spaces"
+        launch_chrome("http://user:secret@proxy.example:8080", profile, "https://example.com")
+        command = launch.call_args.args[0]
+        assert command[0] == "/custom/Chrome Browser"
+        assert f"--user-data-dir={profile.resolve()}" in command
+        assert "--proxy-server=http://proxy.example:8080" in command
+        assert not any("secret" in arg for arg in command)
+        attach_chrome(9222, attempts=1)
+        options = attach.call_args.kwargs["options"]
+        assert options.binary_location == command[0]
+        assert options.debugger_address == "127.0.0.1:9222"
+        del os.environ["DISPLAY"]
+        try:
+            launch_chrome(None, profile, "https://example.com")
+        except RuntimeError as error:
+            assert "desktop" in str(error)
+        else:
+            raise AssertionError("Linux without a display attempted a GUI launch")
+        assert launch.call_count == 1
+        os.environ["WAYLAND_DISPLAY"] = "wayland-0"
+        launch_chrome(None, profile, "https://example.com")
+        assert launch.call_count == 2
+
+    for platform, notifier in (("darwin", "osascript"), ("linux", "notify-send")):
+        with patch.object(sys, "platform", platform), \
+                patch.object(shutil, "which", return_value=f"/usr/bin/{notifier}") as which, \
+                patch.object(subprocess, "run", return_value=Mock(returncode=0)) as run, \
+                patch(f"{__name__}.log") as logged:
+            message = "Possible appointment; $(literal text)"
+            notify(message)
+            assert run.call_args.args[0][0] == notifier
+            assert run.call_args.args[0][-1] == message
+            logged.assert_any_call("notification", message)
+            # Missing tools, missing D-Bus, or failed commands must not lose the alert or abort capture.
+            for error in (OSError("missing notifier"), subprocess.TimeoutExpired(notifier, 10)):
+                run.side_effect = error
+                notify(message)
+            run.side_effect = None
+            run.return_value.returncode = 1
+            notify(message)
+            which.return_value = None
+            run.reset_mock()
+            notify(message)
+            run.assert_not_called()
 
     assert normalized("POLICÍA - Toma de huellas") == "POLICIA - TOMA DE HUELLAS"
     assert not challenge_present("Please enable JavaScript to use this normal page")

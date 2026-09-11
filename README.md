@@ -2,7 +2,7 @@
 
 Checks the Spanish ICP+ site for TIE fingerprint appointments in Barcelona and Madrid. It alerts you when a possible slot appears; it never books or confirms an appointment.
 
-Everything runs through one script, `cita_monitor.py`. In continuous mode it opens one Chrome window per proxy, checks in all of them in parallel on a uniform schedule, and sends a macOS notification the moment a possible slot appears.
+Everything runs through one script, `cita_monitor.py`. In continuous mode it opens one Chrome window per proxy, checks in all of them in parallel on a uniform schedule, and alerts you when a possible slot appears. Alerts are logged in the terminal and also sent as desktop notifications when available.
 
 ## Run the automation
 
@@ -16,7 +16,7 @@ That opens one Chrome window per active proxy and keeps each session on a 5-minu
 
 ## Setup
 
-Requires Python 3 and Google Chrome on macOS.
+Requires Python 3 and Google Chrome or Chromium on macOS or Linux. Linux browser mode needs a graphical desktop session (`DISPLAY` or `WAYLAND_DISPLAY`); on a remote server, use a remote desktop so you can complete proxy logins and site challenges. Run Chrome as your normal desktop user.
 
 ```bash
 python3 -m venv .venv
@@ -27,16 +27,34 @@ cp applicants.example.json applicants.json
 
 Edit `applicants.json` with the applicant's real details. Keep one entry per province (`8` for Barcelona, `28` for Madrid). This file is Git-ignored because it contains personal data.
 
+On Linux, install Google Chrome or Chromium and make sure `google-chrome`, `google-chrome-stable`, `chromium`, or `chromium-browser` is on `PATH`. On Debian/Ubuntu, `python3-venv` supplies virtual-environment support and the optional `libnotify-bin` package supplies `notify-send` for desktop notifications. If notifications are unavailable, alerts stay in the terminal and monitoring continues.
+
+For a custom browser installation, set `CHROME_BINARY` to the executable path or command name. The monitor uses it for both launching the browser and selecting the matching Selenium driver:
+
+```bash
+CHROME_BINARY=/usr/bin/chromium python3 -u cita_monitor.py --proxies proxies.txt --interval 300
+```
+
+Capture fresh sessions on Linux using your local applicant and proxy files; browser profiles and saved cookies should not be copied from the Mac.
+
 ## Capture a session
 
 ICP+ sits behind F5 bot protection. `--capture` opens or attaches to Chrome, waits for the office list, saves its cookies, and checks appointments in that same browser. Complete any authentication or challenge manually in the window; capture detects the office list automatically within five minutes. No terminal input is needed.
 
-Direct connection — start Chrome yourself:
+Direct connection — start Chrome yourself on macOS:
 
 ```bash
 /Applications/Google\ Chrome.app/Contents/MacOS/Google\ Chrome \
   --remote-debugging-port=9222 \
   --user-data-dir="$PWD/.chrome-profile"
+python3 cita_monitor.py --capture
+```
+
+On Linux, start Chrome with the same flags (use `chromium` if that is your installed browser), then run capture from another terminal:
+
+```bash
+google-chrome --remote-debugging-port=9222 --user-data-dir="$PWD/.chrome-profile"
+# In another terminal, with the virtual environment activated:
 python3 cita_monitor.py --capture
 ```
 
@@ -64,7 +82,7 @@ python3 -u cita_monitor.py --proxies proxies.txt --every 30
 
 `--every N` divides the cadence across sessions: the per-session interval becomes `N × (number of proxies)`, so requests spread uniformly — one every N seconds. Use `--interval 300` instead to set the per-session interval directly. The schedule is a fixed wall-clock grid: every session keeps an exact period no matter how long a check takes, start times are staggered evenly, and `--jitter S` adds up to S seconds of random delay per check if you want less robotic timing.
 
-Interval mode always checks inside Chrome (HTTP replay is not used there): startup captures open one window at a time (ten simultaneous F5 challenges can stall renderers), wait for the office list, and reuse that verified page for the first check. The flow paces itself with human-like delays between form steps to keep the F5 bot score low. A session that completes a check keeps its cookies — they pin it to a healthy backend node; cookies are fully reset only after a failure or a bounce to the app's index/infogenerica interstitials, which the flow retries automatically. If F5 rejects a request, the session cools down 90s and retries in the same window before escalating; a persistent block or repeated failure closes the browser and re-captures a fresh session — that also handles a sticky proxy rotating its exit IP. If the proxies themselves fail (e.g. traffic exhausted), sessions back off and keep retrying, so the monitor resumes by itself once they work again. When a possible slot appears, the script sends a macOS notification and stops. Ctrl-C cancels challenge waiting without needing Enter.
+Interval mode always checks inside Chrome (HTTP replay is not used there): startup captures open one window at a time (ten simultaneous F5 challenges can stall renderers), wait for the office list, and reuse that verified page for the first check. The flow paces itself with human-like delays between form steps to keep the F5 bot score low. A session that completes a check keeps its cookies — they pin it to a healthy backend node; cookies are fully reset only after a failure or a bounce to the app's index/infogenerica interstitials, which the flow retries automatically. If F5 rejects a request, the session cools down 90s and retries in the same window before escalating; a persistent block or repeated failure closes the browser and re-captures a fresh session — that also handles a sticky proxy rotating its exit IP. If the proxies themselves fail (e.g. traffic exhausted), sessions back off and keep retrying, so the monitor resumes by itself once they work again. When a possible slot appears, the script logs an alert, attempts a desktop notification, and stops. Ctrl-C cancels challenge waiting without needing Enter.
 
 The minimum per-session interval is 60 seconds; under 5 minutes per session is discouraged because frequent checks can trigger protection.
 
