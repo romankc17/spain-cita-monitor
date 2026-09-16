@@ -19,6 +19,7 @@ import os
 import random
 import re
 import shutil
+import smtplib
 import ssl
 import subprocess
 import sys
@@ -27,6 +28,7 @@ import threading
 import time
 import unicodedata
 from datetime import datetime
+from email.message import EmailMessage
 from pathlib import Path
 from urllib.parse import urljoin, urlparse
 
@@ -234,7 +236,8 @@ def current_page(driver, method, url, timeout=45, expected=None, stop=None):
             time.sleep(1)
 
 
-def navigate_page(driver, url, method="GET", data=None, expected=None, timeout=45, stop=None):
+def navigate_page(driver, url, method="GET", data=None, expected=None, timeout=45, stop=None,
+                  button=None):
     if method == "GET":
         try:
             driver.get(url)
@@ -243,7 +246,10 @@ def navigate_page(driver, url, method="GET", data=None, expected=None, timeout=4
             pass
     else:
         previous = (driver.current_url, driver.page_source)
-        driver.execute_script(POST_SCRIPT, url, data or {})
+        if button and not isinstance(driver, RequestsDriver):
+            driver.find_element("css selector", button).click()
+        else:
+            driver.execute_script(POST_SCRIPT, url, data or {})
         if not isinstance(driver, RequestsDriver):
             try:
                 WebDriverWait(driver, 120).until(
@@ -289,11 +295,11 @@ def option_matching(select, wanted):
     raise RuntimeError(f"No option matching {wanted!r}. Available: {choices}")
 
 
-def submit_form(driver, page, form, updates=None, action=None):
+def submit_form(driver, page, form, updates=None, action=None, button=None):
     data = form_values(form)
     data.update(updates or {})
     target = urljoin(page["url"], action or form.get("action", ""))
-    return navigate_page(driver, target, "POST", data)
+    return navigate_page(driver, target, "POST", data, button=button)
 
 
 def classify_document(page):
@@ -453,8 +459,8 @@ def _check_flow(driver, args, applicant, office_name, reuse_entry=False, force_r
             flow_error(page["url"], f"Unrecognized ICP+ response at {page['url']}")
         form = parent_form(page["soup"], "#btnEnviar", "Confirmation page")
         human_pause(driver)
-        # Solicitar Cita's onclick changes the action; the form defaults to salirInicio.
-        page = submit_form(driver, page, form, action="acCitar")
+        # Chrome must run the site's handler: it sets the current action and tokens.
+        page = submit_form(driver, page, form, action="acCitar", button="#btnEnviar")
     raise RuntimeError("ICP+ kept asking for confirmation; its flow may have changed")
 
 
@@ -467,6 +473,35 @@ def load_roster(path):
         if missing:
             raise SystemExit(f"{path}: applicant is missing {sorted(missing)}")
     return data
+
+
+def send_slot_email(message, config_path=Path("smtp.json")):
+    if not config_path.exists():
+        log("email", "Email alerts disabled: smtp.json is missing.", C.YELLOW)
+        return False
+    try:
+        config = json.loads(config_path.read_text(encoding="utf-8"))
+        if not isinstance(config, dict) or any(
+            not isinstance(config.get(key), str) or not config[key].strip()
+            for key in ("host", "username", "password", "recipient")
+        ):
+            raise ValueError("Missing SMTP settings")
+        mail = EmailMessage()
+        mail["Subject"] = "Possible Spain TIE appointment available"
+        mail["From"] = config["username"]
+        mail["To"] = config["recipient"]
+        mail.set_content(message)
+        with smtplib.SMTP(config["host"], int(config["port"]), timeout=30) as server:
+            server.starttls(context=ssl.create_default_context())
+            server.login(config["username"], config["password"])
+            server.send_message(mail)
+        log("email", f"Slot alert sent to {config['recipient']}", C.GREEN)
+        return True
+    except (OSError, smtplib.SMTPException, ValueError, KeyError, TypeError) as error:
+        # SMTP responses can contain account details; log only the error type.
+        log("email", f"Slot email failed ({type(error).__name__}); "
+                     "the appointment alert is still logged.", C.RED)
+        return False
 
 
 def notify(message):
@@ -805,6 +840,10 @@ class ProxySession:
                 if state == "available":
                     log(self.tag, f"\aSLOTS AVAILABLE — {label} at {office_name} — {procedure}",
                         C.BOLD + C.GREEN)
+                    send_slot_email(
+                        f"Possible appointment available in {location} at {office_name}.\n"
+                        f"Procedure: {procedure}\nCheck ICP+ now: {entry_url(applicant, runtime)}\n"
+                        "No appointment has been booked.")
                     return "available"
                 color = C.DIM + C.GREEN if state == "no_slots" else C.YELLOW
                 log(self.tag, f"{state} · {label}", color)
@@ -864,7 +903,7 @@ class ProxySession:
 
 
 class Scheduler:
-    """Runs Chrome sessions on a grid with a shared minimum check gap."""
+    """Stagger Chrome checks while enforcing a separate cooldown per proxy."""
 
     def __init__(self, sessions, interval, bundle, roster, runtime, entry, jitter=0):
         self.sessions = sessions
@@ -878,9 +917,7 @@ class Scheduler:
         self.stop = threading.Event()
         # ponytail: one capture at a time limits Chrome load; bound parallelism if startup is too slow.
         self.capture_lock = threading.Lock()
-        self.check_lock = threading.Lock()
-        self.check_gap = max(MIN_CHECK_GAP, interval / len(sessions)) if interval else 0
-        self.last_check_finished = None
+        self.last_check_started = {}
 
     def run_once(self):
         """Check every session in parallel; return one result per session."""
@@ -904,25 +941,26 @@ class Scheduler:
         return origin + (math.floor((after - origin) / self.interval) + 1) * self.interval
 
     def _check(self, session):
-        """Run one session after the shared cooldown from the previous check."""
-        with self.check_lock:
-            if self.last_check_finished is not None:
-                wait = self.last_check_finished + self.check_gap - time.monotonic()
-                if wait > 0 and self.stop.wait(wait):
-                    return None
-            try:
-                return session.check_all(self.bundle, self.roster, self.runtime)
-            finally:
-                self.last_check_finished = time.monotonic()
+        """Each proxy has one worker; other proxies do not consume its cooldown."""
+        previous = self.last_check_started.get(session)
+        if previous is not None:
+            wait = previous + max(MIN_CHECK_GAP, self.interval) - time.monotonic()
+            if wait > 0 and self.stop.wait(wait):
+                return None
+        if self.stop.is_set():
+            return None
+        self.last_check_started[session] = time.monotonic()
+        return session.check_all(self.bundle, self.roster, self.runtime)
 
     def run(self):
-        """Start each session on its grid, then serialize checks through the cooldown."""
+        """Start each proxy on its own staggered schedule."""
         self.started_at = time.monotonic()
         threads = [threading.Thread(target=self._loop, args=(index, session))
                    for index, session in enumerate(self.sessions)]
         jitter = f" · jitter ≤{self.jitter}s" if self.jitter else ""
-        log("monitor", f"{len(self.sessions)} sessions · at least {self.check_gap:.0f}s "
-                       f"between checks{jitter} · Ctrl-C to stop", C.CYAN)
+        log("monitor", f"{len(self.sessions)} sessions · target spacing "
+                       f"{self.interval / len(self.sessions):g}s · at least {self.interval}s "
+                       f"between starts per proxy{jitter} · Ctrl-C to stop", C.CYAN)
         try:
             for thread in threads:
                 thread.start()
@@ -942,8 +980,7 @@ class Scheduler:
         while not self.stop.is_set():
             # Apply backoff before relaunching Chrome, not just before checking.
             wait = next_tick - time.monotonic()
-            if wait > 0 and not session.fresh_capture and \
-                    self.stop.wait(wait + random.uniform(0, self.jitter)):
+            if wait > 0 and self.stop.wait(wait + random.uniform(0, self.jitter)):
                 return
             if session.browser is None:
                 cooloffs = 0
@@ -971,7 +1008,7 @@ class Scheduler:
                     # F5 rejections are often transient: let the score cool down
                     # and retry in the same window before relaunching Chrome.
                     cooloffs += 1
-                    delay = 90 * cooloffs
+                    delay = max(self.interval, MIN_CHECK_GAP, 90 * cooloffs)
                     log(session.tag, f"cooldown {delay:.0f}s, retry in same window", C.DIM)
                     next_tick = now + delay
                     continue
@@ -1001,6 +1038,33 @@ def self_test():
 
     # Pacing between form steps is exercised live; keep the self-test fast.
     globals()["human_pause"] = lambda driver: None
+
+    with tempfile.TemporaryDirectory() as tmp, \
+            patch.object(smtplib, "SMTP") as smtp, \
+            patch(f"{__name__}.log"):
+        config_path = Path(tmp) / "smtp.json"
+        config_path.write_text(json.dumps({
+            "host": "smtp.example.com", "port": 587, "username": "sender@example.com",
+            "password": "test-secret", "recipient": "romanchhetri02@gmail.com",
+        }))
+        assert send_slot_email("Possible slot; nothing booked.", config_path)
+        smtp.assert_called_once_with("smtp.example.com", 587, timeout=30)
+        server = smtp.return_value.__enter__.return_value
+        context = server.starttls.call_args.kwargs["context"]
+        assert context.check_hostname and context.verify_mode == ssl.CERT_REQUIRED
+        server.login.assert_called_once_with("sender@example.com", "test-secret")
+        mail = server.send_message.call_args.args[0]
+        assert mail["To"] == "romanchhetri02@gmail.com"
+        assert "Possible slot; nothing booked." in mail.get_content()
+        assert "test-secret" not in mail.as_string()
+        server.send_message.side_effect = smtplib.SMTPException("delivery failed")
+        assert not send_slot_email("Possible slot", config_path)
+        smtp.reset_mock()
+        config_path.write_text("{}")
+        assert not send_slot_email("Possible slot", config_path)
+        config_path.unlink()
+        assert not send_slot_email("Possible slot", config_path)
+        smtp.assert_not_called()
 
     # Browser discovery, launch and attachment use the same executable on both OSes.
     for platform, executable in (
@@ -1147,6 +1211,11 @@ def self_test():
 
         def delete_cookie(self, name):
             self.deleted.append(name)
+
+        def find_element(self, by, selector):
+            assert (by, selector) == ("css selector", "#btnEnviar")
+            return Mock(click=lambda: self.execute_script(
+                POST_SCRIPT, "https://icp.administracionelectronica.gob.es/native-action", {}))
 
     applicant = {"nie": "X0000000T", "name": "TEST", "nationality": "NEPAL"}
     fake = FakeChrome()
@@ -1330,6 +1399,8 @@ def self_test():
             final_request = navigation.call_args
             assert final_request.args[1].endswith("/acCitar"), final_request
             assert final_request.args[2:] == ("POST", {"token": "keep-me"})
+            if not isinstance(driver, RequestsDriver):
+                assert driver.current_url.endswith("/native-action")
 
     def stubbed(path, error=None):
         session = ProxySession(None, path)
@@ -1351,6 +1422,18 @@ def self_test():
             .check_all(None, [applicant], args) == "blocked"
         assert stubbed(Path(tmp) / "changed.json", RuntimeError("form changed")) \
             .check_all(None, [applicant], args) is None
+
+        # Both one-shot and continuous checks share this slot-only email trigger.
+        with patch(f"{__name__}.check") as checked, \
+                patch(f"{__name__}.send_slot_email", return_value=False) as emailed:
+            checked.return_value = ("no_slots", "Toma de huellas")
+            session = stubbed(Path(tmp) / "email.json", None)
+            assert session.check_all(None, [applicant], args) == "ok"
+            emailed.assert_not_called()
+            checked.return_value = ("available", "Toma de huellas")
+            assert session.check_all(None, [applicant], args) == "available"
+            emailed.assert_called_once()
+            assert entry_url(applicant, args) in emailed.call_args.args[0]
 
         # A verified Chrome session must remain the transport for later checks.
         browser_session = ProxySession(proxies[0], Path(tmp) / "browser.json")
@@ -1478,12 +1561,11 @@ def self_test():
         def __call__(self):
             return self.now
 
-    def run_loop(session, results, interval=200, end=None):
+    def run_loop(session, results, interval=300, end=None):
         clock = FakeClock()
         session.check_all.side_effect = results
         session.fresh_capture = False
         scheduler = Scheduler([session], interval, None, [], args, url)
-        scheduler.check_gap = 0  # scheduling tests isolate the per-session grid
         scheduler.started_at = clock.now
         end = clock.now + interval * len(results) if end is None else end
 
@@ -1499,33 +1581,58 @@ def self_test():
             scheduler._loop(0, session)
         return [call.args[0] for call in scheduler.stop.wait.call_args_list]
 
-    # Every session shares one cooldown, including after a failed check.
+    # A failed check consumes only its own proxy's cooldown.
     clock = FakeClock()
     checked = Mock()
-    checked.check_all.side_effect = ["ok", None]
-    scheduler = Scheduler([checked], 60, None, [], args, url)
-    scheduler.last_check_finished = clock.now
+    checked.check_all.side_effect = [None, "ok"]
+    other = Mock()
+    other.check_all.return_value = "ok"
+    scheduler = Scheduler([checked, other], 300, None, [], args, url)
+    scheduler.last_check_started[checked] = clock.now
 
     def cooldown(seconds):
         clock.now += seconds
         return False
 
     scheduler.stop = Mock()
+    scheduler.stop.is_set.return_value = False
     scheduler.stop.wait.side_effect = cooldown
     with patch(f"{__name__}.time.monotonic", clock):
-        assert scheduler._check(checked) == "ok"
         assert scheduler._check(checked) is None
+        assert scheduler._check(other) == "ok"
+        assert clock.now == 1300  # another proxy runs without a shared wait
+        assert scheduler._check(checked) == "ok"
     assert [call.args[0] for call in scheduler.stop.wait.call_args_list] == [300, 300]
     assert checked.check_all.call_count == 2
 
+    # Two complete five-proxy cycles: 0,60,120,180,240,300,360,...,540.
+    sessions = [Mock(tag=str(index), browser=object()) for index in range(5)]
+    scheduler = Scheduler(sessions, 300, None, [], args, url)
+    scheduler.started_at = 1000
+    starts = []
+    for index, session in enumerate(sessions):
+        clock = FakeClock()
+        session.check_all.side_effect = lambda *_: starts.append((clock.now - 1000, index)) or "ok"
+
+        def wait(seconds):
+            clock.now += seconds
+            return clock.now >= 1600
+
+        scheduler.stop = Mock()
+        scheduler.stop.is_set.return_value = False
+        scheduler.stop.wait.side_effect = wait
+        with patch(f"{__name__}.time.monotonic", clock):
+            scheduler._loop(index, session)
+    assert sorted(starts) == [(offset, (offset // 60) % 5) for offset in range(0, 600, 60)]
+
     steady = Mock(tag="steady", browser=object())
-    assert run_loop(steady, ["ok", "ok"]) == [200, 200]
+    assert run_loop(steady, ["ok", "ok"]) == [300, 300]
     assert steady.check_all.call_count == 2
 
     blocked = Mock(tag="blocked", browser=object())
     blocked.close_browser.side_effect = lambda: setattr(blocked, "browser", None)
-    # Two in-window cooldowns (90s, 180s), then close + full backoff (1200s).
-    assert run_loop(blocked, ["blocked", "blocked", "blocked"]) == [90, 180, 1200]
+    # Even blocked sessions keep the per-proxy minimum before escalating backoff.
+    assert run_loop(blocked, ["blocked", "blocked", "blocked"]) == [300, 300, 1200]
     assert blocked.recapture.call_count == 0
     # A blocked Chrome session is dropped so the next iteration re-captures
     # cookies (a sticky proxy may have rotated its exit IP).
@@ -1550,8 +1657,7 @@ def self_test():
     assert run_loop(repeated, [None, None, None], end=2500) == [300, 600, 1200]
     assert repeated.recapture.call_count == 1
 
-    # A check that overruns its slot still lands back on the grid: period 200,
-    # first check takes 250, so only 150 remain until the next grid tick.
+    # A slow check skips its missed turn; it never overlaps another on that proxy.
     clock = FakeClock()
     stalled = Mock(tag="stalled", browser=object())
     stalled.fresh_capture = False
@@ -1560,14 +1666,13 @@ def self_test():
     def slow_then_fast(*_args):
         check_count["count"] += 1
         if check_count["count"] == 1:
-            clock.now += 250
+            clock.now += 350
         return "ok"
 
     stalled.check_all.side_effect = slow_then_fast
-    scheduler = Scheduler([stalled], 200, None, [], args, url)
-    scheduler.check_gap = 0  # this test isolates the existing fixed grid
+    scheduler = Scheduler([stalled], 300, None, [], args, url)
     scheduler.started_at = clock.now
-    end = clock.now + 600
+    end = clock.now + 900
 
     def wait(seconds):
         clock.now += seconds
@@ -1580,7 +1685,7 @@ def self_test():
             patch(f"{__name__}.notify"):
         scheduler._loop(0, stalled)
     waits = [call.args[0] for call in scheduler.stop.wait.call_args_list]
-    assert waits == [150, 200], waits
+    assert waits == [250, 300], waits
 
     # A session without a browser captures first; a failed capture backs off
     # and retries, and a recovered session joins the grid instead of drifting.
@@ -1594,8 +1699,24 @@ def self_test():
         return captured
 
     recovering.recapture.side_effect = fake_recapture
-    assert run_loop(recovering, ["ok"], end=1400) == [300, 100]
+    assert run_loop(recovering, ["ok"], end=1400) == [300, 300]
     assert recovering.recapture.call_count == 2
+
+    # --interval alone picks up proxies.txt; --every 60 gives the same five-proxy cycle.
+    for option, value in (("--interval", "300"), ("--every", "60")):
+        with patch.object(sys, "argv", ["cita_monitor.py", option, value]), \
+                patch.object(Path, "exists", return_value=True), \
+                patch.object(Path, "is_file", return_value=True), \
+                patch(f"{__name__}.load_roster", return_value=[applicant]), \
+                patch(f"{__name__}.load_proxies", return_value=[
+                    f"http://proxy.example:{10000 + index}" for index in range(5)
+                ]) as loaded, \
+                patch(f"{__name__}.Scheduler") as scheduled:
+            main()
+            loaded.assert_called_once_with("proxies.txt")
+            assert len(scheduled.call_args.args[0]) == 5
+            assert scheduled.call_args.args[1] == 300
+            scheduled.return_value.run.assert_called_once()
 
     with build_session({"user_agent": "ua", "cookies": []}, proxies[0]) as session:
         with patch.dict("os.environ", {"HTTPS_PROXY": "http://wrong-proxy:1234"}):
@@ -1625,13 +1746,14 @@ def main():
     parser.add_argument("--session-file", default=DEFAULT_SESSION)
     parser.add_argument("--proxies",
                         help="file with one proxy per line (host:port or "
-                             "scheme://user:pass@host:port); runs one parallel session per proxy")
+                             "scheme://user:pass@host:port); continuous mode uses proxies.txt "
+                             "automatically when present")
     parser.add_argument("--interval", type=int,
-                        help="target N seconds per session (minimum 300); a shared "
-                             "5-minute gap still applies between all checks; "
+                        help="target N seconds between starts per proxy (minimum 300); "
+                             "proxies are evenly staggered across that interval; "
                              "without it the script runs once and exits")
     parser.add_argument("--every", type=int,
-                        help="target N seconds between checks across all sessions (minimum 300); "
+                        help="target N seconds between checks across all sessions; "
                              "the per-session interval becomes N x session count "
                              "(overrides --interval)")
     parser.add_argument("--jitter", type=int, default=0,
@@ -1653,6 +1775,9 @@ def main():
         parser.error("NIE, name, and nationality are required for every applicant")
     entry = entry_url(roster[0], args)
 
+    if args.proxies is None and (args.interval is not None or args.every is not None) \
+            and Path("proxies.txt").is_file():
+        args.proxies = "proxies.txt"
     proxies = load_proxies(args.proxies) if args.proxies else [None]
     base = Path(args.session_file)
     paths = [session_path(base, proxy) for proxy in proxies] if args.proxies else [base]
@@ -1663,8 +1788,8 @@ def main():
 
     interval = args.interval
     if args.every is not None:
-        if args.every < MIN_CHECK_GAP:
-            parser.error(f"--every must be at least {MIN_CHECK_GAP} seconds")
+        if args.every <= 0:
+            parser.error("--every must be positive")
         interval = args.every * len(sessions)
     if interval is not None:
         if interval < MIN_CHECK_GAP:

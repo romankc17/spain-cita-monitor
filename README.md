@@ -4,15 +4,17 @@ Checks the Spanish ICP+ site for TIE fingerprint appointments in Barcelona and M
 
 Everything runs through one script, `cita_monitor.py`. In continuous mode it opens one Chrome window per proxy, checks in all of them in parallel on a uniform schedule, and alerts you when a possible slot appears. Alerts are logged in the terminal and also sent as desktop notifications when available.
 
+When `smtp.json` is present, a possible slot also triggers an email in both one-shot and continuous mode. This private, Git-ignored file contains `host`, `port`, `username`, `password`, and `recipient`; the configured recipient is `romanchhetri02@gmail.com`. SMTP uses STARTTLS with certificate verification. No-slot results and browser login prompts do not send email. Delivery failures are logged and do not suppress the appointment result or desktop notification. Keep this file private when moving the monitor to another machine.
+
 ## Run the automation
 
 With `applicants.json` and `proxies.txt` in place (see Setup), one command:
 
 ```bash
-python3 -u cita_monitor.py --proxies proxies.txt --every 300
+python3 -u cita_monitor.py --interval 300
 ```
 
-That opens one Chrome window per active proxy and leaves at least five minutes between completed checks across all proxies. If only one proxy works, it checks at most once every five minutes; unavailable proxies never make a working proxy run faster. If a Chrome window asks for the proxy username/password, enter it in that window. To stop: Ctrl-C. To stop leftover windows after an unclean exit: `pkill -f "user-data-dir=$PWD/.chrome-profile"`.
+Continuous mode automatically reads `proxies.txt` when present (or use `--proxies PATH` to choose another file). With five active proxies and `--interval 300`, the target check starts are A=0s, B=60s, C=120s, D=180s, E=240s, A=300s, B=360s. Each proxy has its own browser and at least 300 seconds between check starts; another proxy can run during that cooldown. Browser startup and slow responses can delay starts. Unavailable proxies keep their turns unused and never make a working proxy run faster. If a Chrome window asks for the proxy username/password, enter it in that window. To stop: Ctrl-C. To stop leftover windows after an unclean exit: `pkill -f "user-data-dir=$PWD/.chrome-profile"`.
 
 ## Setup
 
@@ -32,7 +34,7 @@ On Linux, install Google Chrome or Chromium and make sure `google-chrome`, `goog
 For a custom browser installation, set `CHROME_BINARY` to the executable path or command name. The monitor uses it for both launching the browser and selecting the matching Selenium driver:
 
 ```bash
-CHROME_BINARY=/usr/bin/chromium python3 -u cita_monitor.py --proxies proxies.txt --every 300
+CHROME_BINARY=/usr/bin/chromium python3 -u cita_monitor.py --interval 300
 ```
 
 Capture fresh sessions on Linux using your local applicant and proxy files; browser profiles and saved cookies should not be copied from the Mac.
@@ -74,17 +76,19 @@ Once, in parallel across all sessions over HTTP (exits non-zero if any session f
 python3 cita_monitor.py --proxies proxies.txt
 ```
 
-Continuously in parallel Chrome windows, with at least five minutes between checks across every proxy:
+The site's “Solicitar Cita” button runs JavaScript that HTTP replay cannot execute. If HTTP checks redirect to the public information page, use `--capture` for a complete one-shot browser check. Chrome checks click the actual button so its current handler runs.
+
+Continuously in Chrome, with five minutes between starts for each proxy and evenly staggered turns:
 
 ```bash
-python3 -u cita_monitor.py --proxies proxies.txt --every 300
+python3 -u cita_monitor.py --interval 300
 ```
 
-`--every N` sets the requested gap across all sessions and makes the per-session interval `N × (number of proxies)`. `--interval N` sets the per-session target directly. Both modes enforce a shared minimum gap of 300 seconds after every completed check, including failed checks and recovery. `--jitter S` adds up to S seconds of random delay if you want less robotic timing.
+`--interval N` sets the per-proxy interval; spacing between proxies is `N ÷ (number of proxies)`. Alternatively, `--every N` sets the target spacing across proxies and makes the per-proxy interval `N × (number of proxies)`, so `--every 60` is equivalent to `--interval 300` with five proxies. The per-proxy interval must be at least 300 seconds. Checks on one proxy never overlap; failed checks still consume its cooldown, and longer failure backoff remains in place. `--jitter S` adds up to S seconds of random delay; leave it at zero for uniform target spacing. These times apply to whole availability checks, each of which navigates several form steps.
 
-Interval mode always checks inside Chrome (HTTP replay is not used there): startup captures open one window at a time (ten simultaneous F5 challenges can stall renderers), wait for the office list, and reuse that verified page for the first check. The flow paces itself with human-like delays between form steps to keep the F5 bot score low. A session that completes a check keeps its cookies — they pin it to a healthy backend node; cookies are fully reset only after a failure or a bounce to the app's index/infogenerica interstitials, which the flow retries automatically. If F5 rejects a request, the session cools down 90s and retries in the same window before escalating; a persistent block or repeated failure closes the browser and re-captures a fresh session — that also handles a sticky proxy rotating its exit IP. If the proxies themselves fail (e.g. traffic exhausted), sessions back off and keep retrying, so the monitor resumes by itself once they work again. When a possible slot appears, the script logs an alert, attempts a desktop notification, and stops. Ctrl-C cancels challenge waiting without needing Enter.
+Interval mode always checks inside Chrome (HTTP replay is not used there): startup captures open one window at a time (ten simultaneous F5 challenges can stall renderers), wait for the office list, and reuse that verified page for the first check. The flow paces itself with human-like delays between form steps to keep the F5 bot score low. A session that completes a check keeps its cookies — they pin it to a healthy backend node; cookies are fully reset only after a failure or a bounce to the app's index/infogenerica interstitials, which the flow retries automatically. If F5 rejects a request, the session waits at least its per-proxy interval and retries in the same window before escalating; a persistent block or repeated failure closes the browser and re-captures a fresh session — that also handles a sticky proxy rotating its exit IP. If the proxies themselves fail (e.g. traffic exhausted), sessions back off and keep retrying, so the monitor resumes by itself once they work again. When a possible slot appears, the script logs an alert, attempts a desktop notification, and stops. Ctrl-C cancels challenge waiting without needing Enter.
 
-The minimum value for both the shared check gap and a per-session interval is 300 seconds.
+A slow check can miss its next scheduled turn. The monitor delays or skips that turn instead of overlapping checks or shortening the per-proxy cooldown.
 
 Recovery waits before reopening Chrome and captures one browser at a time. Only a completed availability check resets the failure backoff. A rejected or redirected session does not blacklist a backend for other sessions.
 

@@ -8,6 +8,9 @@ proxies.txt
 proxies.*.txt
 !proxies.example.txt
 
+# Local SMTP credentials. Never commit.
+smtp.json
+
 __pycache__/
 *.pyc
 .venv/
