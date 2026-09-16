@@ -917,7 +917,9 @@ class Scheduler:
         self.stop = threading.Event()
         # ponytail: one capture at a time limits Chrome load; bound parallelism if startup is too slow.
         self.capture_lock = threading.Lock()
+        self.check_start_lock = threading.Lock()
         self.last_check_started = {}
+        self.last_check_started_any = None
 
     def run_once(self):
         """Check every session in parallel; return one result per session."""
@@ -941,15 +943,24 @@ class Scheduler:
         return origin + (math.floor((after - origin) / self.interval) + 1) * self.interval
 
     def _check(self, session):
-        """Each proxy has one worker; other proxies do not consume its cooldown."""
+        """Enforce both the per-proxy cooldown and uniform cross-proxy starts."""
         previous = self.last_check_started.get(session)
         if previous is not None:
             wait = previous + max(MIN_CHECK_GAP, self.interval) - time.monotonic()
             if wait > 0 and self.stop.wait(wait):
                 return None
-        if self.stop.is_set():
-            return None
-        self.last_check_started[session] = time.monotonic()
+        with self.check_start_lock:
+            if self.last_check_started_any is not None:
+                wait = (self.last_check_started_any + self.interval / len(self.sessions)
+                        - time.monotonic())
+                if wait > 0 and self.stop.wait(wait):
+                    return None
+            if self.stop.is_set():
+                return None
+            started = time.monotonic()
+            self.last_check_started[session] = started
+            self.last_check_started_any = started
+            log(session.tag, "check started", C.DIM)
         return session.check_all(self.bundle, self.roster, self.runtime)
 
     def run(self):
@@ -1600,30 +1611,31 @@ def self_test():
     with patch(f"{__name__}.time.monotonic", clock):
         assert scheduler._check(checked) is None
         assert scheduler._check(other) == "ok"
-        assert clock.now == 1300  # another proxy runs without a shared wait
+        assert clock.now == 1450  # half-interval spacing with two proxies
         assert scheduler._check(checked) == "ok"
-    assert [call.args[0] for call in scheduler.stop.wait.call_args_list] == [300, 300]
+    assert [call.args[0] for call in scheduler.stop.wait.call_args_list] == [300, 150, 150]
     assert checked.check_all.call_count == 2
 
     # Two complete five-proxy cycles: 0,60,120,180,240,300,360,...,540.
     sessions = [Mock(tag=str(index), browser=object()) for index in range(5)]
     scheduler = Scheduler(sessions, 300, None, [], args, url)
-    scheduler.started_at = 1000
+    clock = FakeClock()
     starts = []
     for index, session in enumerate(sessions):
-        clock = FakeClock()
-        session.check_all.side_effect = lambda *_: starts.append((clock.now - 1000, index)) or "ok"
+        session.check_all.side_effect = lambda *_, index=index: \
+            starts.append((clock.now - 1000, index)) or "ok"
 
-        def wait(seconds):
-            clock.now += seconds
-            return clock.now >= 1600
+    def stagger(seconds):
+        clock.now += seconds
+        return False
 
-        scheduler.stop = Mock()
-        scheduler.stop.is_set.return_value = False
-        scheduler.stop.wait.side_effect = wait
-        with patch(f"{__name__}.time.monotonic", clock):
-            scheduler._loop(index, session)
-    assert sorted(starts) == [(offset, (offset // 60) % 5) for offset in range(0, 600, 60)]
+    scheduler.stop = Mock()
+    scheduler.stop.is_set.return_value = False
+    scheduler.stop.wait.side_effect = stagger
+    with patch(f"{__name__}.time.monotonic", clock):
+        for session in sessions * 2:
+            assert scheduler._check(session) == "ok"
+    assert starts == [(offset, (offset // 60) % 5) for offset in range(0, 600, 60)]
 
     steady = Mock(tag="steady", browser=object())
     assert run_loop(steady, ["ok", "ok"]) == [300, 300]
