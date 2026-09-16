@@ -41,6 +41,7 @@ from selenium.webdriver.support.ui import WebDriverWait
 DEFAULT_URL = "https://icp.administracionelectronica.gob.es/icpplustieb/citar?p={code}&locale=es"
 MADRID_URL = "https://icp.administracionelectronica.gob.es/icpplustiem/citar?p={code}&locale=es"
 PROVINCES = {8: "Barcelona", 28: "Madrid"}
+MIN_CHECK_GAP = 300
 NO_SLOTS = ("EN ESTE MOMENTO NO HAY CITAS DISPONIBLES", "NO HAY CITAS DISPONIBLES")
 CLAVE_ONLY = "DISPONIBLES PARA LA RESERVA SIN CL@VE"
 BLOCKED = ("INTRUSION PREVENTION VIOLATION", "INTRUSION PREVENTION TRIGGERED")
@@ -863,7 +864,7 @@ class ProxySession:
 
 
 class Scheduler:
-    """Runs every session in its own Chrome window on a fixed wall-clock grid."""
+    """Runs Chrome sessions on a grid with a shared minimum check gap."""
 
     def __init__(self, sessions, interval, bundle, roster, runtime, entry, jitter=0):
         self.sessions = sessions
@@ -877,6 +878,9 @@ class Scheduler:
         self.stop = threading.Event()
         # ponytail: one capture at a time limits Chrome load; bound parallelism if startup is too slow.
         self.capture_lock = threading.Lock()
+        self.check_lock = threading.Lock()
+        self.check_gap = max(MIN_CHECK_GAP, interval / len(sessions)) if interval else 0
+        self.last_check_finished = None
 
     def run_once(self):
         """Check every session in parallel; return one result per session."""
@@ -899,17 +903,26 @@ class Scheduler:
         origin = self.started_at + stagger * index
         return origin + (math.floor((after - origin) / self.interval) + 1) * self.interval
 
+    def _check(self, session):
+        """Run one session after the shared cooldown from the previous check."""
+        with self.check_lock:
+            if self.last_check_finished is not None:
+                wait = self.last_check_finished + self.check_gap - time.monotonic()
+                if wait > 0 and self.stop.wait(wait):
+                    return None
+            try:
+                return session.check_all(self.bundle, self.roster, self.runtime)
+            finally:
+                self.last_check_finished = time.monotonic()
+
     def run(self):
-        """Each session checks in Chrome every interval seconds, starting i *
-        interval / N later, so checks spread uniformly across the period and
-        every session keeps an exact period no matter how long a check takes."""
+        """Start each session on its grid, then serialize checks through the cooldown."""
         self.started_at = time.monotonic()
         threads = [threading.Thread(target=self._loop, args=(index, session))
                    for index, session in enumerate(self.sessions)]
-        stagger = self.interval / len(self.sessions)
         jitter = f" · jitter ≤{self.jitter}s" if self.jitter else ""
-        log("monitor", f"{len(self.sessions)} sessions · one check every {stagger:.0f}s "
-                       f"(every {self.interval}s per session){jitter} · Ctrl-C to stop", C.CYAN)
+        log("monitor", f"{len(self.sessions)} sessions · at least {self.check_gap:.0f}s "
+                       f"between checks{jitter} · Ctrl-C to stop", C.CYAN)
         try:
             for thread in threads:
                 thread.start()
@@ -944,7 +957,9 @@ class Scheduler:
                     log(session.tag, f"no session — retry in {delay:.0f}s", C.DIM)
                     next_tick = time.monotonic() + delay
                     continue
-            result = session.check_all(self.bundle, self.roster, self.runtime)
+            result = self._check(session)
+            if self.stop.is_set():
+                return
             now = time.monotonic()
             if result == "available":
                 notify(f"Possible appointment via {session.tag}. Check ICP+ now.")
@@ -1468,6 +1483,7 @@ def self_test():
         session.check_all.side_effect = results
         session.fresh_capture = False
         scheduler = Scheduler([session], interval, None, [], args, url)
+        scheduler.check_gap = 0  # scheduling tests isolate the per-session grid
         scheduler.started_at = clock.now
         end = clock.now + interval * len(results) if end is None else end
 
@@ -1482,6 +1498,25 @@ def self_test():
                 patch(f"{__name__}.notify"):
             scheduler._loop(0, session)
         return [call.args[0] for call in scheduler.stop.wait.call_args_list]
+
+    # Every session shares one cooldown, including after a failed check.
+    clock = FakeClock()
+    checked = Mock()
+    checked.check_all.side_effect = ["ok", None]
+    scheduler = Scheduler([checked], 60, None, [], args, url)
+    scheduler.last_check_finished = clock.now
+
+    def cooldown(seconds):
+        clock.now += seconds
+        return False
+
+    scheduler.stop = Mock()
+    scheduler.stop.wait.side_effect = cooldown
+    with patch(f"{__name__}.time.monotonic", clock):
+        assert scheduler._check(checked) == "ok"
+        assert scheduler._check(checked) is None
+    assert [call.args[0] for call in scheduler.stop.wait.call_args_list] == [300, 300]
+    assert checked.check_all.call_count == 2
 
     steady = Mock(tag="steady", browser=object())
     assert run_loop(steady, ["ok", "ok"]) == [200, 200]
@@ -1530,6 +1565,7 @@ def self_test():
 
     stalled.check_all.side_effect = slow_then_fast
     scheduler = Scheduler([stalled], 200, None, [], args, url)
+    scheduler.check_gap = 0  # this test isolates the existing fixed grid
     scheduler.started_at = clock.now
     end = clock.now + 600
 
@@ -1591,10 +1627,11 @@ def main():
                         help="file with one proxy per line (host:port or "
                              "scheme://user:pass@host:port); runs one parallel session per proxy")
     parser.add_argument("--interval", type=int,
-                        help="repeat the checks every N seconds (minimum 60); "
+                        help="target N seconds per session (minimum 300); a shared "
+                             "5-minute gap still applies between all checks; "
                              "without it the script runs once and exits")
     parser.add_argument("--every", type=int,
-                        help="target N seconds between requests across all sessions; "
+                        help="target N seconds between checks across all sessions (minimum 300); "
                              "the per-session interval becomes N x session count "
                              "(overrides --interval)")
     parser.add_argument("--jitter", type=int, default=0,
@@ -1626,16 +1663,13 @@ def main():
 
     interval = args.interval
     if args.every is not None:
-        if args.every < 1:
-            parser.error("--every must be at least 1 second")
+        if args.every < MIN_CHECK_GAP:
+            parser.error(f"--every must be at least {MIN_CHECK_GAP} seconds")
         interval = args.every * len(sessions)
     if interval is not None:
-        if interval < 60:
-            parser.error(f"per-session interval works out to {interval}s; "
-                         "increase --every or add more proxies (minimum 60)")
-        if interval < 300:
-            log("monitor", "WARNING: per-session intervals below 5 minutes increase "
-                           "the chance of a bot-protection challenge.", C.YELLOW)
+        if interval < MIN_CHECK_GAP:
+            parser.error(f"per-session interval works out to {interval}s; minimum is "
+                         f"{MIN_CHECK_GAP}s")
     if args.jitter and interval is None:
         parser.error("--jitter only applies with --interval/--every")
 
